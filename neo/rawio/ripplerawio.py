@@ -50,6 +50,7 @@ import datetime
 import os
 import re
 import warnings
+import pdb
 
 import numpy as np
 import quantities as pq
@@ -97,7 +98,7 @@ class RippleRawIO(BaseRawIO):
             IDs of nfX file from which to load data, e.g., if set to
             5 only data from the nf5 file are loaded.
             If 'all', then all nfX will be loaded.
-            Contrary to previsous version of the IO  (<0.7), nfx_to_load
+            Contrary to previous version of the IO  (<0.7), nfx_to_load
             must be set at the init before parse_header().
 
     Examples:
@@ -364,26 +365,30 @@ class RippleRawIO(BaseRawIO):
                         ch_name = chan['labels']
                         ch_id = str(self.__nfx_ext_header[nfx_nb][i]['electrode_id'])
                         units = chan['units']
-                    ######################################
-                    sig_dtype = 'int16'
-                    ######################################
-                    # max_analog_val/min_analog_val/max_digital_val/min_analog_val are int16!!!!!
-                    # dangerous situation so cast to float everyone
+                    sig_dtype = 'float32'  ###'int16'
+                    # max_analog_val/min_analog_val/max_digital_val/
+                    #  min_analog_val are int16!!!!!  Dangerous situation so
+                    #  cast to float everywhere
                     if np.isnan(float(chan['min_analog_val'])):
                         gain = 1
                         offset = 0
                     else:
-                        gain = (float(chan['max_analog_val']) - float(chan['min_analog_val'])) / \
-                               (float(chan['max_digital_val']) - float(chan['min_digital_val']))
-                        offset = -float(chan['min_digital_val']) \
-                            * gain + float(chan['min_analog_val'])
+                        gain = (
+                            float(chan['max_analog_val'])
+                            - float(chan['min_analog_val'])
+                        )/(
+                            float(chan['max_digital_val'])
+                            - float(chan['min_digital_val'])
+                        )
+                        offset = (
+                            -float(chan['min_digital_val'])*gain
+                            + float(chan['min_analog_val'])
+                        )
                     stream_id = str(nfx_nb)
-                    ######################################
                     signal_channels.append((
                         ch_name, ch_id, sr, sig_dtype, units, gain, offset,
                         stream_id
                     ))
-                    ######################################
 
             # check nb segment per nfx
             nb_segments_for_nfx = [len(self.nfx_datas[nfx_nb]) for nfx_nb in self.nfx_to_load]
@@ -841,13 +846,10 @@ class RippleRawIO(BaseRawIO):
             # used connector pin (e.g., 1-37 on bank A, B, C or D)
             ('connector_pin', 'uint8'),
             # digital and analog value ranges of the signal
-            #######################
-            # CHANGE THESE??
             ('min_digital_val', 'int16'),
             ('max_digital_val', 'int16'),
             ('min_analog_val', 'int16'),
             ('max_analog_val', 'int16'),
-            #######################
             # units of the analog range values ("mV" or "uV")
             ('units', 'S16'),
             # filter settings used to create nfx from source signal
@@ -1607,9 +1609,7 @@ class RippleRawIO(BaseRawIO):
         """
         Extracts the actual waveform dtype set for each channel.
         """
-        #######################
-        # hmmmmmm
-        #
+
         # Blackrock code giving the appropriate dtype
         conv = {0: 'int8', 1: 'int8', 2: 'int16', 4: 'int32'}
 
@@ -1618,14 +1618,14 @@ class RippleRawIO(BaseRawIO):
 
         # get the dtype of waveform (this is stupidly complicated)
         if self.__is_set(
-                np.array(self.__nev_basic_header['additionnal_flags']), 0):
+            np.array(self.__nev_basic_header['additionnal_flags']), 0
+        ):
             dtype_waveforms = {k: 'int16' for k in all_el_ids}
-        #######################
         else:
             # extract bytes per waveform
             waveform_bytes = \
                 self.__nev_ext_header[b'NEUEVWAV']['bytes_per_waveform']
-            # extract dtype for waveforms fro each electrode
+            # extract dtype for waveforms from each electrode
             dtype_waveforms = dict(zip(all_el_ids, conv[waveform_bytes]))
 
         return dtype_waveforms
