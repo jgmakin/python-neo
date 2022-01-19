@@ -310,6 +310,7 @@ from neo.io.pickleio import PickleIO
 from neo.io.plexonio import PlexonIO
 from neo.io.rawbinarysignalio import RawBinarySignalIO
 from neo.io.rawmcsio import RawMCSIO
+from neo.io.rippleio import RippleIO
 from neo.io.spike2io import Spike2IO
 from neo.io.spikegadgetsio import SpikeGadgetsIO
 from neo.io.spikeglxio import SpikeGLXIO
@@ -360,6 +361,7 @@ iolist = [
     PlexonIO,
     RawBinarySignalIO,
     RawMCSIO,
+    RippleIO,
     Spike2IO,
     SpikeGadgetsIO,
     SpikeGLXIO,
