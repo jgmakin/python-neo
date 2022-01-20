@@ -63,8 +63,8 @@ from .baserawio import (
 
 class RippleRawIO(BaseRawIO):
     """
-    Class for reading data in from a file set recorded by the Blackrock
-    (Cerebus) recording system.
+    Class for reading data in from a file set recorded by the Ripple/Blackrock
+    recording system.
 
     Upon initialization, the class is linked to the available set of Blackrock
     files.
@@ -329,12 +329,12 @@ class RippleRawIO(BaseRawIO):
             for nfx_nb in self.nfx_to_load:
                 self.__match_nfx_and_nev_segment_ids(nfx_nb)
 
-        self.nfx_datas = {}
+        self.nfx_data = {}
         self.sig_sampling_rates = {}
         if len(self.nfx_to_load) > 0:
             for nfx_nb in self.nfx_to_load:
                 spec = self.__nfx_spec[nfx_nb]
-                self.nfx_datas[nfx_nb] = self.__nfx_data_reader[spec](nfx_nb)
+                self.nfx_data[nfx_nb] = self.__nfx_data_reader[spec](nfx_nb)
 
                 sr = float(main_sampling_rate / self.__nfx_basic_header[nfx_nb]['period'])
                 self.sig_sampling_rates[nfx_nb] = sr
@@ -365,7 +365,7 @@ class RippleRawIO(BaseRawIO):
                         ch_name = chan['labels']
                         ch_id = str(self.__nfx_ext_header[nfx_nb][i]['electrode_id'])
                         units = chan['units']
-                    sig_dtype = 'float32'  ###'int16'
+                    sig_dtype = 'float32'
                     # max_analog_val/min_analog_val/max_digital_val/
                     #  min_analog_val are int16!!!!!  Dangerous situation so
                     #  cast to float everywhere
@@ -391,7 +391,7 @@ class RippleRawIO(BaseRawIO):
                     ))
 
             # check nb segment per nfx
-            nb_segments_for_nfx = [len(self.nfx_datas[nfx_nb]) for nfx_nb in self.nfx_to_load]
+            nb_segments_for_nfx = [len(self.nfx_data[nfx_nb]) for nfx_nb in self.nfx_to_load]
             assert all(nb == nb_segments_for_nfx[0] for nb in nb_segments_for_nfx),\
                    'Segment nb not consistanent across nfx files'
             self._nb_segment = nb_segments_for_nfx[0]
@@ -404,7 +404,7 @@ class RippleRawIO(BaseRawIO):
             for data_bl in range(self._nb_segment):
                 t_stop = 0.
                 for nfx_nb in self.nfx_to_load:
-                    length = self.nfx_datas[nfx_nb][data_bl].shape[0]
+                    length = self.nfx_data[nfx_nb][data_bl].shape[0]
                     if self.__nfx_data_header[nfx_nb] is None:
                         t_start = 0.
                     else:
@@ -484,9 +484,9 @@ class RippleRawIO(BaseRawIO):
         self._generate_minimal_annotations()
 
         block_ann = self.raw_annotations['blocks'][0]
-        block_ann['description'] = 'Block of data from Blackrock file set.'
+        block_ann['description'] = 'Block of data from Ripple file set.'
         block_ann['file_origin'] = self.filename
-        block_ann['name'] = "Blackrock Data Block"
+        block_ann['name'] = "Ripple Data Block"
         block_ann['rec_datetime'] = rec_datetime
         block_ann['avail_file_set'] = [k for k, v in self._avail_files.items() if v]
         block_ann['avail_nfx'] = self._avail_nfx
@@ -568,7 +568,7 @@ class RippleRawIO(BaseRawIO):
     def _get_signal_size(self, block_index, seg_index, stream_index):
         stream_id = self.header['signal_streams'][stream_index]['id']
         nfx_nb = int(stream_id)
-        memmap_data = self.nfx_datas[nfx_nb][seg_index]
+        memmap_data = self.nfx_data[nfx_nb][seg_index]
         return memmap_data.shape[0]
 
     def _get_signal_t_start(self, block_index, seg_index, stream_index):
@@ -580,7 +580,7 @@ class RippleRawIO(BaseRawIO):
                                 stream_index, channel_indexes):
         stream_id = self.header['signal_streams'][stream_index]['id']
         nfx_nb = int(stream_id)
-        memmap_data = self.nfx_datas[nfx_nb][seg_index]
+        memmap_data = self.nfx_data[nfx_nb][seg_index]
         if channel_indexes is None:
             channel_indexes = slice(None)
         sig_chunk = memmap_data[i_start:i_stop, channel_indexes]
@@ -740,7 +740,7 @@ class RippleRawIO(BaseRawIO):
         nfx_file_id = np.fromfile(filename, count=1, dtype=dt0)[0]
         if nfx_file_id['file_id'].decode() == 'NEURALSG':
             spec = '2.1'
-        elif nfx_file_id['file_id'].decode() in ['NEURALCD', 'NEUCDFLT']:
+        elif nfx_file_id['file_id'].decode() == 'NEUCDFLT':
             spec = '{}.{}'.format(
                 nfx_file_id['ver_major'], nfx_file_id['ver_minor'])
         else:
@@ -776,7 +776,7 @@ class RippleRawIO(BaseRawIO):
         """
         filename = '.'.join([self._filenames['nfx'], 'nf%i' % nfx_nb])
 
-        # basic header (file_id: NEURALCD)
+        # basic header (file_id: NEUCDFLT)
         dt0 = [
             ('file_id', 'S8'),
             # label of sampling groun (e.g. "1kS/s" or "LFP Low")
@@ -788,7 +788,7 @@ class RippleRawIO(BaseRawIO):
 
         nfx_basic_header = np.fromfile(filename, count=1, dtype=dt0)[0]
 
-        # "extended" header (last field of file_id: NEURALCD)
+        # "extended" header (last field of file_id: NEUCDFLT)
         # (to facilitate compatibility with higher file specs)
         offset_dt0 = np.dtype(dt0).itemsize
         shape = nfx_basic_header['channel_count']
@@ -1847,13 +1847,13 @@ class RippleRawIO(BaseRawIO):
         for data_bl in range(self._nb_segment):
             keep_seg = True
             for nfx_nb in self.nfx_to_load:
-                length = self.nfx_datas[nfx_nb][data_bl].shape[0]
+                length = self.nfx_data[nfx_nb][data_bl].shape[0]
                 keep_seg = keep_seg and (length >= 2)
 
             if not keep_seg:
                 removed_seg.append(data_bl)
                 for nfx_nb in self.nfx_to_load:
-                    self.nfx_datas[nfx_nb].pop(data_bl)
+                    self.nfx_data[nfx_nb].pop(data_bl)
                     self.__nfx_data_header[nfx_nb].pop(data_bl)
 
         # Keys need to be increasing from 0 to maximum in steps of 1
@@ -1862,8 +1862,8 @@ class RippleRawIO(BaseRawIO):
             for j in range(i + 1, self._nb_segment):
                 # remap nfx seg index
                 for nfx_nb in self.nfx_to_load:
-                    data = self.nfx_datas[nfx_nb].pop(j)
-                    self.nfx_datas[nfx_nb][j - 1] = data
+                    data = self.nfx_data[nfx_nb].pop(j)
+                    self.nfx_data[nfx_nb][j - 1] = data
 
                     data_header = self.__nfx_data_header[nfx_nb].pop(j)
                     self.__nfx_data_header[nfx_nb][j - 1] = data_header
