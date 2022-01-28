@@ -204,8 +204,10 @@ class AnalogSignalProxy(BaseProxy):
                 i_stop = int((t_stop - self.t_start).magnitude * sr.magnitude)
         return i_start, i_stop, sig_t_start
 
-    def load(self, time_slice=None, strict_slicing=True,
-                    channel_indexes=None, magnitude_mode='rescaled'):
+    def load(
+        self, time_slice=None, strict_slicing=True, channel_indexes=None,
+        magnitude_mode='rescaled'
+    ):
         '''
         *Args*:
             :time_slice: None or tuple of the time slice expressed with quantities.
@@ -248,12 +250,15 @@ class AnalogSignalProxy(BaseProxy):
             else:
                 fixed_chan_indexes = self._inner_stream_channels[channel_indexes]
 
-        i_start, i_stop, sig_t_start = self._time_slice_indices(time_slice,
-                                                                strict_slicing=strict_slicing)
+        i_start, i_stop, sig_t_start = self._time_slice_indices(
+            time_slice, strict_slicing=strict_slicing
+        )
 
-        raw_signal = self._rawio.get_analogsignal_chunk(block_index=self._block_index,
-                    seg_index=self._seg_index, i_start=i_start, i_stop=i_stop,
-                    stream_index=self._stream_index, channel_indexes=fixed_chan_indexes)
+        raw_signal = self._rawio.get_analogsignal_chunk(
+            block_index=self._block_index, seg_index=self._seg_index,
+            i_start=i_start, i_stop=i_stop, stream_index=self._stream_index,
+            channel_indexes=fixed_chan_indexes
+        )
 
         # if slice in channel : change name and array_annotations
         if raw_signal.shape[1] != self._nb_chan:
@@ -277,15 +282,18 @@ class AnalogSignalProxy(BaseProxy):
                 dtype = 'float64'
             else:
                 dtype = 'float32'
-            sig = self._rawio.rescale_signal_raw_to_float(raw_signal, dtype=dtype,
-                                    stream_index=self._stream_index,
-                                    channel_indexes=fixed_chan_indexes)
+            sig = self._rawio.rescale_signal_raw_to_float(
+                raw_signal, dtype=dtype, stream_index=self._stream_index,
+                channel_indexes=fixed_chan_indexes
+            )
             units = self.units
 
-        anasig = AnalogSignal(sig, units=units, copy=False, t_start=sig_t_start,
-                    sampling_rate=self.sampling_rate, name=name,
-                    file_origin=self.file_origin, description=self.description,
-                    array_annotations=array_annotations, **self.annotations)
+        anasig = AnalogSignal(
+            sig, units=units, copy=False, t_start=sig_t_start,
+            sampling_rate=self.sampling_rate, name=name,
+            file_origin=self.file_origin, description=self.description,
+            array_annotations=array_annotations, **self.annotations
+        )
 
         return anasig
 

@@ -65,8 +65,10 @@ import warnings
 import numpy as np
 import quantities as pq
 
-from .baserawio import (BaseRawIO, _signal_channel_dtype, _signal_stream_dtype,
-                _spike_channel_dtype, _event_channel_dtype)
+from .baserawio import (
+    BaseRawIO, _signal_channel_dtype, _signal_stream_dtype,
+    _spike_channel_dtype, _event_channel_dtype
+)
 
 
 class BlackrockRawIO(BaseRawIO):

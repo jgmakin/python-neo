@@ -315,9 +315,11 @@ class RippleRawIO(BaseRawIO):
         assert all(all_spec[0] == spec for spec in all_spec), \
             "Files don't have the same internal version"
 
-        if len(self.nfx_to_load) > 0 and \
-                self.__nfx_spec[self.nfx_to_load[0]] == '2.1' and \
-                not self._avail_files['nev']:
+        if (
+            len(self.nfx_to_load) > 0 and 
+            self.__nfx_spec[self.nfx_to_load[0]] == '2.1' and
+            not self._avail_files['nev']
+        ):
             pass
             # Because rescaling to volts requires information from nev file (dig_factor)
             # Remove if raw loading becomes possible
@@ -365,25 +367,32 @@ class RippleRawIO(BaseRawIO):
                         ch_name = chan['labels']
                         ch_id = str(self.__nfx_ext_header[nfx_nb][i]['electrode_id'])
                         units = chan['units']
+                    
+                    ##########
+                    # Because these are Ripple nfX files
                     sig_dtype = 'float32'
-                    # max_analog_val/min_analog_val/max_digital_val/
-                    #  min_analog_val are int16!!!!!  Dangerous situation so
-                    #  cast to float everywhere
-                    if np.isnan(float(chan['min_analog_val'])):
-                        gain = 1
-                        offset = 0
-                    else:
-                        gain = (
-                            float(chan['max_analog_val'])
-                            - float(chan['min_analog_val'])
-                        )/(
-                            float(chan['max_digital_val'])
-                            - float(chan['min_digital_val'])
-                        )
-                        offset = (
-                            -float(chan['min_digital_val'])*gain
-                            + float(chan['min_analog_val'])
-                        )
+                    ##########
+
+                    # The signals stored in nfX files are floats and therefore
+                    #  can (and do) store the original analog values (in
+                    #  contrast to Blackrock's nsX files, which store the
+                    #  signals as integers and then convert them here).
+                    gain = 1
+                    offset = 0
+                
+                    ##########
+                    # DELETE ME
+                    # gain = (
+                    #     chan['max_analog_val'] - chan['min_analog_val']
+                    # )/(
+                    #     chan['max_digital_val'] - chan['min_digital_val']
+                    # )
+                    # offset = (
+                    #     - chan['min_digital_val']*gain 
+                    #     + chan['min_analog_val']
+                    # )
+                    ##########
+
                     stream_id = str(nfx_nb)
                     signal_channels.append((
                         ch_name, ch_id, sr, sig_dtype, units, gain, offset,
@@ -807,6 +816,9 @@ class RippleRawIO(BaseRawIO):
         """
         filename = '.'.join([self._filenames['nfx'], 'nf%i' % nfx_nb])
 
+        # See Trellis Nev Spec from Ripple---although the latest version,
+        #  R01838_08, CONTAINS ERRORS.
+
         # basic header (file_id: NEUCDFLT)
         dt0 = [
             ('file_id', 'S8'),
@@ -817,7 +829,9 @@ class RippleRawIO(BaseRawIO):
             ('bytes_in_headers', 'uint32'),
             # label of the sampling group (e.g., "1 kS/s" or "LFP low")
             ('label', 'S16'),
-            ('comment', 'S256'),
+            ('comment', 'S200'),
+            ('application_to_create_file', 'S52'),
+            ('processor_timestamp', 'uint32'),
             ('period', 'uint32'),
             ('timestamp_resolution', 'uint32'),
             # time origin: 2byte uint16 values for ...
@@ -841,27 +855,23 @@ class RippleRawIO(BaseRawIO):
             ('type', 'S2'),
             ('electrode_id', 'uint16'),
             ('electrode_label', 'S16'),
-            # used front-end amplifier bank (e.g., A, B, C, D)
-            ('physical_connector', 'uint8'),
-            # used connector pin (e.g., 1-37 on bank A, B, C or D)
-            ('connector_pin', 'uint8'),
-            # digital and analog value ranges of the signal
-            ('min_digital_val', 'int16'),
-            ('max_digital_val', 'int16'),
-            ('min_analog_val', 'int16'),
-            ('max_analog_val', 'int16'),
+            ('physical_connector', 'B'),
+            ('connector_pin', 'B'),
+            ('min_analog_val', 'float32'),
+            ('max_analog_val', 'float32'),
             # units of the analog range values ("mV" or "uV")
             ('units', 'S16'),
             # filter settings used to create nfx from source signal
-            ('hi_freq_corner', 'uint32'),
-            ('hi_freq_order', 'uint32'),
-            ('hi_freq_type', 'uint16'),  # 0=None, 1=Butterworth
-            ('lo_freq_corner', 'uint32'),
-            ('lo_freq_order', 'uint32'),
-            ('lo_freq_type', 'uint16')]  # 0=None, 1=Butterworth
-
+            ('hi_freq_corner', 'uint32'),  # in milliHz
+            ('hi_freq_order', 'uint32'),   # 0=None
+            ('hi_freq_type', 'uint16'),    # 0=None, 1=Butterworth, 2=Chebyshev
+            ('lo_freq_corner', 'uint32'),  # in milliHz
+            ('lo_freq_order', 'uint32'),   # 0=None
+            ('lo_freq_type', 'uint16')     # 0=None, 1=Butterworth, 2=Chebyshev
+        ]
         nfx_ext_header = np.memmap(
             filename, shape=shape, offset=offset_dt0, dtype=dt1, mode='r')
+        print(nfx_ext_header)
 
         return nfx_basic_header, nfx_ext_header
 
@@ -1184,53 +1194,75 @@ class RippleRawIO(BaseRawIO):
                     list_nonempty_nfx_segments.append(v)
 
             # Account for paused segments
-            # This increases nev event segment ids if from the nfx an additional segment is found
-            # If one new segment, i.e. that could not be determined from the nev was found,
-            # all following ids need to be increased to account for the additional segment before
+            # This increases nev event segment ids if from the nfx an
+            # additional segment is found.  If one new segment, i.e. that could
+            # not be determined from the nev was found, all following ids need
+            # to be increased to account for the additional segment before
             for k, (data, ev_ids) in self.nev_data.items():
 
                 # Check all nonempty nfx segments
                 for i, seg in enumerate(list_nonempty_nfx_segments[:]):
 
                     # Last timestamp in this nfx segment
-                    # Not subtracting nfx offset from end because spike extraction might continue
-                    end_of_current_nfx_seg = seg['timestamp'] + \
-                        seg['nb_data_points'] * self.__nfx_basic_header[nfx_nb]['period']
+                    # Not subtracting nfx offset from end because spike
+                    #  extraction might continue
+                    end_of_current_nfx_seg = (
+                        seg['timestamp'] + 
+                        seg['nb_data_points']*self.__nfx_basic_header[nfx_nb]['period']
+                    )
 
-                    mask_after_seg = (ev_ids == i) & \
-                                    (data['timestamp'] > end_of_current_nfx_seg + nfx_period)
+                    mask_after_seg = (
+                        (ev_ids == i) & 
+                        (data['timestamp'] > end_of_current_nfx_seg+nfx_period)
+                    )
 
-                    # Show warning if spikes do not fit any segment (+- 1 sampling 'tick')
+                    # Show warning if spikes do not fit any segment
+                    #  (+- 1 sampling 'tick')
                     # Spike should belong to segment before
-                    mask_outside = (ev_ids == i) & \
-                            (data['timestamp'] < int(seg['timestamp']) - nfx_offset - nfx_period)
+                    mask_outside = (
+                        (ev_ids == i) & 
+                        (data['timestamp'] < int(seg['timestamp']) - nfx_offset - nfx_period)
+                    )
 
                     if len(data[mask_outside]) > 0:
-                        warnings.warn("Spikes outside any segment. Detected on segment #{}".
-                                      format(i))
+                        warnings.warn(
+                            "Spikes outside any segment. Detected on segment #{}".
+                            format(i)
+                        )
                         ev_ids[mask_outside] -= 1
 
-                    # If some nev data are outside of this nfx segment, increase their segment ids
-                    # and the ids of all following segments. They are checked for the next nfX
-                    # segment then. If they do not fit any of them,
-                    # a warning will be shown, indicating how far outside the segment spikes are
-                    # If they fit the next segment, more segments are possible in nev,
+                    # If some nev data are outside of this nfx segment,
+                    # increase their segment ids and the ids of all following
+                    # segments. They are checked for the next nfX segment then.
+                    # If they do not fit any of them, a warning will be shown,
+                    # indicating how far outside the segment spikes are If they
+                    # fit the next segment, more segments are possible in nev,
                     # because a new one has been discovered
                     if len(data[mask_after_seg]) > 0:
                         # Warning if spikes are after last segment
                         if i == len(list_nonempty_nfx_segments) - 1:
-                            timestamp_resolution = self.__nfx_params[self.__nfx_spec[
-                                nfx_nb]]('timestamp_resolution', nfx_nb)
-                            time_after_seg = (data[mask_after_seg]['timestamp'][-1]
-                                              - end_of_current_nfx_seg) / timestamp_resolution
-                            warnings.warn("Spikes {}s after last segment.".format(time_after_seg))
+                            timestamp_resolution = self.__nfx_params[
+                                self.__nfx_spec[nfx_nb]](
+                                    'timestamp_resolution', nfx_nb
+                                )
+                            time_after_seg = (
+                                data[mask_after_seg]['timestamp'][-1]
+                                - end_of_current_nfx_seg
+                            )/timestamp_resolution
+                            warnings.warn(
+                                "Spikes {}s after last segment.".
+                                format(time_after_seg)
+                            )
                             # Break out of loop because it's the last iteration
-                            # and the spikes should stay connected to last segment
+                            # and the spikes should stay connected to last
+                            # segment
                             break
 
-                        # If reset and no segment detected in nev, then these segments cannot be
-                        # distinguished in nev, which is a big problem
-                        # XXX 96 is an arbitrary number based on observations in available files
+                        # If reset and no segment detected in nev, then these
+                        # segments cannot be distinguished in nev, which is a 
+                        # big problem
+                        # XXX 96 is an arbitrary number based on observations
+                        # in available files
                         elif list_nonempty_nfx_segments[i + 1]['timestamp'] - nfx_offset <= 96:
                             # If not all definitely belong to the next segment,
                             # then it cannot be distinguished where some belong
@@ -1243,18 +1275,25 @@ class RippleRawIO(BaseRawIO):
                         ev_ids[mask_after_seg] += 1
 
             # consistency check: same number of segments for nfx and nev data
-            assert nb_possible_nev_segments == len(nonempty_nfx_segments), \
-                ('Inconsistent nf{0} and nev file. {1} segments present in .nev file, but {2} in '
-                 'nf{0} file.'.format(nfx_nb, nb_possible_nev_segments,
-                                      len(nonempty_nfx_segments)))
+            assert nb_possible_nev_segments == len(nonempty_nfx_segments), (
+                'Inconsistent nf{0} and nev file. {1} segments present in .nev'
+                'file, but {2} in nf{0} file.'.format(
+                    nfx_nb, nb_possible_nev_segments,
+                    len(nonempty_nfx_segments)
+                )
+            )
 
-            new_nev_segment_id_mapping = dict(zip(range(nb_possible_nev_segments),
-                                                  sorted(list(nonempty_nfx_segments))))
+            new_nev_segment_id_mapping = dict(zip(
+                range(nb_possible_nev_segments),
+                sorted(list(nonempty_nfx_segments))
+            ))
 
             # replacing event ids by matched event ids in place
             for k, (data, ev_ids) in self.nev_data.items():
                 if len(ev_ids):
-                    ev_ids[:] = np.vectorize(new_nev_segment_id_mapping.__getitem__)(ev_ids)
+                    ev_ids[:] = np.vectorize(
+                        new_nev_segment_id_mapping.__getitem__
+                    )(ev_ids)
 
     def __read_nev_data_variant_a(self):
         """
@@ -1775,10 +1814,15 @@ class RippleRawIO(BaseRawIO):
                 self.__nfx_ext_header[nfx_nb]['min_analog_val'],
             'max_analog_val':
                 self.__nfx_ext_header[nfx_nb]['max_analog_val'],
-            'min_digital_val':
-                self.__nfx_ext_header[nfx_nb]['min_digital_val'],
-            'max_digital_val':
-                self.__nfx_ext_header[nfx_nb]['max_digital_val'],
+            ####################
+            # nfX files don't store the max and min digital values because the
+            #  signals themselves are floats and therefore don't actually need
+            #  to be converted.  So just set them to the analog min/max here.
+            # 'min_digital_val':
+            #     self.__nfx_ext_header[nfx_nb]['min_analog_val'],
+            # 'max_digital_val':
+            #     self.__nfx_ext_header[nfx_nb]['max_analog_val'],
+            ####################
             'timestamp_resolution':
                 self.__nfx_basic_header[nfx_nb]['timestamp_resolution'],
             'bytes_in_headers':
