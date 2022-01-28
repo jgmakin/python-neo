@@ -871,7 +871,6 @@ class RippleRawIO(BaseRawIO):
         ]
         nfx_ext_header = np.memmap(
             filename, shape=shape, offset=offset_dt0, dtype=dt1, mode='r')
-        print(nfx_ext_header)
 
         return nfx_basic_header, nfx_ext_header
 
