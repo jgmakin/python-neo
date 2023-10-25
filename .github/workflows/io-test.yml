@@ -1,0 +1,109 @@
+name: NeoIoTest
+
+on:
+  workflow_call:
+    inputs:
+      os:
+        required: true
+        type: string
+
+concurrency:  # Cancel previous workflows on the same pull request
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-and-test:
+    name: Test on (${{ inputs.os }})
+    runs-on: ${{ inputs.os }}
+    strategy:
+      fail-fast: true
+      matrix:
+        python-version: ['3.9', ]
+    defaults:
+      # by default run in bash mode (required for conda usage)
+      run:
+        shell: bash -l {0}
+    steps:
+
+      - name: Checkout repository
+        uses: actions/checkout@v3
+
+      - name: Get current year-month
+        id: date
+        run: echo "date=$(date +'%Y-%m')" >> $GITHUB_OUTPUT
+
+      - name: Get ephy_testing_data current head hash
+        # the key depend on the last commit repo https://gin.g-node.org/NeuralEnsemble/ephy_testing_data.git
+        id: ephy_testing_data
+        run: |
+          echo "dataset_hash=$(git ls-remote https://gin.g-node.org/NeuralEnsemble/ephy_testing_data.git HEAD | cut -f1)" >> $GITHUB_OUTPUT
+
+      - uses: actions/cache/restore@v3
+        # Loading cache of ephys_testing_dataset
+        id: cache-datasets
+        with:
+          path: ~/ephy_testing_data
+          key: ${{ runner.os }}-datasets-${{ steps.ephy_testing_data.outputs.dataset_hash }}
+          restore-keys: ${{ runner.os }}-datasets-
+
+      - uses: conda-incubator/setup-miniconda@v2.2.0
+        with:
+          activate-environment: neo-test-env
+          python-version: ${{ matrix.python-version }}
+
+      - name: Get current dependencies hash
+        id: dependencies
+        run: |
+          echo "hash=${{hashFiles('**/pyproject.toml', '**/environment_testing.yml')}}" >> $GITHUB_OUTPUT
+
+      - uses: actions/cache/restore@v3
+        # the cache for python package is reset:
+        #   * every month
+        #   * when package dependencies change
+        id: cache-conda-env
+        with:
+          path: /usr/share/miniconda/envs/neo-test-env
+          key: ${{ runner.os }}-conda-env-${{ steps.dependencies.outputs.hash }}-${{ steps.date.outputs.date }}
+          # restore-keys match any key that starts with the restore-key
+          restore-keys: |
+            ${{ runner.os }}-conda-env-${{ steps.dependencies.outputs.hash }}-
+            ${{ runner.os }}-conda-env-
+
+      - name: Install testing dependencies
+        # testing environment is only created from yml if no cache was found
+        # restore-key hits should result in `cache-hit` == 'false'
+        if: steps.cache-conda-env.outputs.cache-hit != 'true'
+        run: |
+          conda env update --name neo-test-env --file environment_testing.yml --prune
+
+      - name: Configure git
+        run: |
+          git config --global user.email "neo_ci@fake_mail.com"
+          git config --global user.name "neo CI"
+
+      - name: Install neo including dependencies
+        # installation with dependencies is only required if no cache was found
+        # restore-key hits should result in `cache-hit` == 'false'
+        if: steps.cache-conda-env.outputs.cache-hit != 'true'
+        run: |
+          pip install --upgrade -e .
+          pip install .[test]
+
+      - name: Install neo without dependencies
+        # only installing neo version to test as dependencies should be in cached conda env already
+        if: steps.cache-conda-env.outputs.cache-hit == 'true'
+        run: |
+          pip install --no-dependencies -e .
+
+      - name: Install wine
+        run: |
+          sudo rm -f /etc/apt/sources.list.d/microsoft-prod.list
+          sudo dpkg --add-architecture i386
+          sudo apt-get update -qq
+          sudo apt-get install -yqq --allow-downgrades libc6:i386 libgcc-s1:i386 libstdc++6:i386 wine
+
+      - name: Test with pytest
+        run: |
+          # only neo.rawio and neo.io
+          pytest --cov=neo neo/test/rawiotest
+          pytest --cov=neo neo/test/iotest

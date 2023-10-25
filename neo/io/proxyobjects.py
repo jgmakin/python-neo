@@ -187,10 +187,10 @@ class AnalogSignalProxy(BaseProxy):
                     assert self.t_start <= t_start <= self.t_stop, 't_start is outside'
                 else:
                     t_start = max(t_start, self.t_start)
-                # the i_start is necessary ceil
-                i_start = int(np.ceil((t_start - self.t_start).magnitude * sr.magnitude))
-                # this needed to get the real t_start of the first sample
-                # because do not necessary match what is demanded
+                # the i_start is rounded to the nearest sample
+                i_start = np.rint((t_start - self.t_start).magnitude * sr.magnitude).astype(np.int64)
+                # this is needed to get the real t_start of the first sample
+                # because it does not necessary match what is demanded
                 sig_t_start = self.t_start + i_start / sr
 
             if t_stop is None:
@@ -198,10 +198,14 @@ class AnalogSignalProxy(BaseProxy):
             else:
                 t_stop = ensure_second(t_stop)
                 if strict_slicing:
-                    assert self.t_start <= t_stop <= self.t_stop, 't_stop is outside'
+                    assert self.t_start <= t_stop <= self.t_stop, 't_stop is outside possible time range'
                 else:
                     t_stop = min(t_stop, self.t_stop)
-                i_stop = int((t_stop - self.t_start).magnitude * sr.magnitude)
+                # calculate duration demanded then round it to nearest sample number
+                # add this to i_start to get i_stop
+                delta = (t_stop - t_start) * sr
+                i_stop = i_start + int(np.rint(delta.simplified.magnitude))
+                
         return i_start, i_stop, sig_t_start
 
     def load(
@@ -288,12 +292,14 @@ class AnalogSignalProxy(BaseProxy):
             )
             units = self.units
 
-        anasig = AnalogSignal(
-            sig, units=units, copy=False, t_start=sig_t_start,
-            sampling_rate=self.sampling_rate, name=name,
-            file_origin=self.file_origin, description=self.description,
-            array_annotations=array_annotations, **self.annotations
-        )
+        else:
+            raise ValueError(f'Invalid magnitude_mode {magnitude_mode}. Accepted values are '
+                             f'"rescaled" and "raw"')
+
+        anasig = AnalogSignal(sig, units=units, copy=False, t_start=sig_t_start,
+                    sampling_rate=self.sampling_rate, name=name,
+                    file_origin=self.file_origin, description=self.description,
+                    array_annotations=array_annotations, **self.annotations)
 
         return anasig
 

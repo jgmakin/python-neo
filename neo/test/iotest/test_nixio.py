@@ -138,7 +138,7 @@ class NixIOTest(unittest.TestCase):
                 neosp = neosig.sampling_period
                 nixsp = create_quantity(timedim.sampling_interval,
                                         timedim.unit)
-                self.assertEqual(neosp, nixsp)
+                self.assertAlmostEqual(neosp, nixsp)
                 tsunit = timedim.unit
                 if "t_start.units" in da.metadata.props:
                     tsunit = da.metadata["t_start.units"]
@@ -168,8 +168,10 @@ class NixIOTest(unittest.TestCase):
     def compare_eests_mtags(self, eestlist, mtaglist):
         self.assertEqual(len(eestlist), len(mtaglist))
         for eest in eestlist:
-            if isinstance(eest, (EventProxy, EpochProxy, SpikeTrainProxy)):
+            if isinstance(eest, (EventProxy, EpochProxy)):
                 eest = eest.load()
+            elif isinstance(eest, SpikeTrainProxy):
+                eest = eest.load(load_waveforms=True)
             mtag = mtaglist[eest.annotations["nix_name"]]
             if isinstance(eest, Epoch):
                 self.compare_epoch_mtag(eest, mtag)
@@ -888,9 +890,6 @@ class NixIOWriteTest(NixIOTest):
         seg.analogsignals.extend(signals)
         seg.spiketrains.extend(spiketrains)
         seg.epochs.extend(epochs)
-        for obj in chain(signals, spiketrains, epochs):
-            obj.segment = seg
-
         views = [ChannelView(index=np.array([0, 3, 4]), obj=signals[0], name="view_of_sig1")]
         groups = [
             Group(objects=(signals[0:1] + spiketrains[0:2] + epochs + views), name="group1"),
@@ -900,8 +899,6 @@ class NixIOWriteTest(NixIOTest):
         block = Block(name="block1")
         block.segments.append(seg)
         block.groups.extend(groups)
-        for obj in chain([seg], groups):
-            obj.block = block
 
         self.write_and_compare([block])
 
@@ -928,8 +925,6 @@ class NixIOWriteTest(NixIOTest):
         seg.analogsignals.extend(signals)
         seg.spiketrains.extend(spiketrains)
         seg.epochs.extend(epochs)
-        for obj in chain(signals, spiketrains, epochs):
-            obj.segment = seg
 
         views = [ChannelView(index=np.array([0, 3, 4]), obj=signals[0], name="view_of_sig1")]
 
@@ -942,8 +937,6 @@ class NixIOWriteTest(NixIOTest):
         block = Block(name="block1")
         block.segments.append(seg)
         block.groups.extend(groups)
-        for obj in chain([seg], groups):
-            obj.block = block
 
         self.write_and_compare([block])
 
@@ -1430,8 +1423,16 @@ class NixIOWriteTest(NixIOTest):
     def test_empty_array_annotations(self):
         wblock = Block("block with spiketrain")
         wseg = Segment()
+        empty_array_annotations = {'emptylist': [],
+                                   'emptyarray': np.array([]),
+                                   'quantitylist': [] * pq.s,
+                                   'quantityarray': np.array([]) * pq.s}
+        expected_array_annotations = {'emptylist': np.array([]),
+                                   'emptyarray': np.array([]),
+                                   'quantitylist': np.array([]) * pq.s,
+                                   'quantityarray': np.array([]) * pq.s}
         wseg.spiketrains = [SpikeTrain(times=[] * pq.s, t_stop=1 * pq.s,
-                                       array_annotations={'empty': []})]
+                                       array_annotations=empty_array_annotations)]
         wblock.segments = [wseg]
         self.writer.write_block(wblock)
         try:
@@ -1441,9 +1442,13 @@ class NixIOWriteTest(NixIOTest):
                       + ' reading the block with an empty array annotation:\n'
                       + str(exc))
         rst = rblock.segments[0].spiketrains[0]
-        self.assertEqual(len(rst.array_annotations), 1)
-        self.assertIn('empty', rst.array_annotations.keys())
-        self.assertEqual(len(rst.array_annotations['empty']), 0)
+        for k, v in expected_array_annotations.items():
+            self.assertIn(k, rst.array_annotations)
+            np.testing.assert_array_equal(rst.array_annotations[k], v)
+            if hasattr(v, 'units'):
+                self.assertEqual(rst.array_annotations[k].units, v.units)
+            else:
+                self.assertFalse(hasattr(rst.array_annotations[k], 'units'))
 
     def test_write_proxyobjects(self):
 
@@ -1500,7 +1505,7 @@ class NixIOWriteTest(NixIOTest):
             unit.add(spiketrain)
 
             # make sure everything is linked properly
-            block.create_relationship()
+            block.check_relationships()
 
             return block
 
