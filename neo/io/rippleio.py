@@ -6,11 +6,10 @@ class RippleIO(RippleRawIO, BaseFromRaw):
     """
     Supplementary class for reading Ripple data using only a single nfx file.
     """
-    name = 'Ripple IO for single nfx'
-    description = (
-        "This IO reads an nfx file from a Ripple Grapevine recording system."
-    )
-    _prefered_signal_group_mode = 'group-by-same-units'
+
+    name = "Ripple IO for single nfx"
+    description = "This IO reads an nfx file from a Ripple Grapevine recording system."
+    _prefered_signal_group_mode = "group-by-same-units"
 
     def __init__(self, filename, **kargs):
         RippleRawIO.__init__(self, filename=filename, **kargs)

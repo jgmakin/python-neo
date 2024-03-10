@@ -70,7 +70,7 @@ from .baserawio import (
     _signal_channel_dtype,
     _signal_stream_dtype,
     _spike_channel_dtype,
-    _event_channel_dtype
+    _event_channel_dtype,
 )
 
 
