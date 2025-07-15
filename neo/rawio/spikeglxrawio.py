@@ -50,22 +50,25 @@ Author : Samuel Garcia
 Some functions are copied from Graham Findlay
 """
 
-from .baserawio import (
-    BaseRawIO,
-    _signal_channel_dtype,
-    _signal_stream_dtype,
-    _spike_channel_dtype,
-    _event_channel_dtype,
-)
-
 from pathlib import Path
 import os
 import re
+from warnings import warn
 
 import numpy as np
 
+from .baserawio import (
+    BaseRawWithBufferApiIO,
+    _signal_channel_dtype,
+    _signal_stream_dtype,
+    _signal_buffer_dtype,
+    _spike_channel_dtype,
+    _event_channel_dtype,
+)
+from .utils import get_memmap_shape
 
-class SpikeGLXRawIO(BaseRawIO):
+
+class SpikeGLXRawIO(BaseRawWithBufferApiIO):
     """
     Class for reading data from a SpikeGLX system
 
@@ -74,20 +77,19 @@ class SpikeGLXRawIO(BaseRawIO):
     dirname: str, default: ''
         The spikeglx folder containing meta/bin files
     load_sync_channel: bool, default: False
-        The last channel (SY0) of each stream is a fake channel used for synchronisation
+        Can be used to load the synch stream as the last channel of the neural data.
+        This option is deprecated and will be removed in version 0.15.
+        From versions higher than 0.14.1 the sync channel is always loaded as a separate stream.
     load_channel_location: bool, default: False
         If True probeinterface is used to load the channel locations from the directory
 
     Notes
     -----
-    * Contrary to other implementations this IO reads the entire folder and subfolders and:
-      deals with several segments based on the `_gt0`, `_gt1`, `_gt2`, etc postfixes
-      deals with all signals "imec0", "imec1" for neuropixel probes and also
-      external signal like"nidq". This is the "device"
-    * For imec device both "ap" and "lf" are extracted so one device have several "streams"
-    * There are several versions depending the neuropixel probe generation (`1.x`/`2.x`/`3.x`)
-    * Here, we assume that the `meta` file has the same structure across all generations.
-    * This IO is developed based on neuropixel generation 2.0, single shank recordings.
+    * This IO reads the entire folder and subfolders locating the `.bin` and `.meta` files
+    * Handles gates and triggers as segments (based on the `_gt0`, `_gt1`, `_t0` , `_t1` in filenames)
+    * Handles all signals coming from different acquisition cards ("imec0", "imec1", etc) in a typical
+        PXIe chassis setup and also external signal like "nidq".
+    * For imec devices both "ap" and "lf" are extracted so even a one device setup will have several "streams"
 
     Examples
     --------
@@ -107,9 +109,16 @@ class SpikeGLXRawIO(BaseRawIO):
     rawmode = "one-dir"
 
     def __init__(self, dirname="", load_sync_channel=False, load_channel_location=False):
-        BaseRawIO.__init__(self)
+        BaseRawWithBufferApiIO.__init__(self)
         self.dirname = dirname
         self.load_sync_channel = load_sync_channel
+        if load_sync_channel:
+            warn(
+                "The load_sync_channel=True option is deprecated and will be removed in version 0.15 \n"
+                "The sync channel is now loaded as a separate stream by default and should be accessed as such. ",
+                DeprecationWarning,
+                stacklevel=2,
+            )
         self.load_channel_location = load_channel_location
 
     def _source_name(self):
@@ -117,42 +126,74 @@ class SpikeGLXRawIO(BaseRawIO):
 
     def _parse_header(self):
         self.signals_info_list = scan_files(self.dirname)
+        _add_segment_order(self.signals_info_list)
 
         # sort stream_name by higher sampling rate first
         srates = {info["stream_name"]: info["sampling_rate"] for info in self.signals_info_list}
         stream_names = sorted(list(srates.keys()), key=lambda e: srates[e])[::-1]
         nb_segment = np.unique([info["seg_index"] for info in self.signals_info_list]).size
 
-        self._memmaps = {}
         self.signals_info_dict = {}
+        # one unique block
+        self._buffer_descriptions = {0: {}}
+        self._stream_buffer_slice = {}
         for info in self.signals_info_list:
-            # key is (seg_index, stream_name)
-            key = (info["seg_index"], info["stream_name"])
-            assert key not in self.signals_info_dict
+            seg_index, stream_name = info["seg_index"], info["stream_name"]
+            key = (seg_index, stream_name)
+            if key in self.signals_info_dict:
+                raise KeyError(f"key {key} is already in the signals_info_dict")
             self.signals_info_dict[key] = info
 
-            # create memmap
-            data = np.memmap(info["bin_file"], dtype="int16", mode="r", offset=0, order="C")
-            # this should be (info['sample_length'], info['num_chan'])
-            # be some file are shorten
-            data = data.reshape(-1, info["num_chan"])
-            self._memmaps[key] = data
+            buffer_id = stream_name
+            block_index = 0
+
+            if seg_index not in self._buffer_descriptions[0]:
+                self._buffer_descriptions[block_index][seg_index] = {}
+
+            self._buffer_descriptions[block_index][seg_index][buffer_id] = {
+                "type": "raw",
+                "file_path": info["bin_file"],
+                "dtype": "int16",
+                "order": "C",
+                "file_offset": 0,
+                "shape": get_memmap_shape(info["bin_file"], "int16", num_channels=info["num_chan"], offset=0),
+            }
 
         # create channel header
+        signal_buffers = []
         signal_streams = []
         signal_channels = []
+        sync_stream_id_to_buffer_id = {}
+
         for stream_name in stream_names:
-            # take first segment
-            info = self.signals_info_dict[0, stream_name]
+            # take first segment to extract the signal info
+            segment_index = 0
+            info = self.signals_info_dict[segment_index, stream_name]
+
+            buffer_id = stream_name
+            buffer_name = stream_name
+            signal_buffers.append((buffer_name, buffer_id))
 
             stream_id = stream_name
-            stream_index = stream_names.index(info["stream_name"])
-            signal_streams.append((stream_name, stream_id))
 
-            # add channels to global list
-            for local_chan in range(info["num_chan"]):
-                chan_name = info["channel_names"][local_chan]
+            signal_streams.append((stream_name, stream_id, buffer_id))
+
+            # add channels to signal channel header
+            for local_channel_index in range(info["num_chan"]):
+                chan_name = info["channel_names"][local_channel_index]
                 chan_id = f"{stream_name}#{chan_name}"
+
+                # Separate sync channel in its own stream
+                is_sync_channel = "SY" in chan_name and not self.load_sync_channel
+                if is_sync_channel:
+                    # This is a sync channel and should be added as its own stream
+                    sync_stream_id = f"{stream_name}-SYNC"
+                    sync_stream_id_to_buffer_id[sync_stream_id] = buffer_id
+                    stream_id_for_chan = sync_stream_id
+
+                else:
+                    stream_id_for_chan = stream_id
+
                 signal_channels.append(
                     (
                         chan_name,
@@ -160,23 +201,57 @@ class SpikeGLXRawIO(BaseRawIO):
                         info["sampling_rate"],
                         "int16",
                         info["units"],
-                        info["channel_gains"][local_chan],
-                        info["channel_offsets"][local_chan],
-                        stream_id,
+                        info["channel_gains"][local_channel_index],
+                        info["channel_offsets"][local_channel_index],
+                        stream_id_for_chan,
+                        buffer_id,
                     )
                 )
-            # check sync channel validity
+
+            # None here means that the all the channels in the buffer will be included
+            self._stream_buffer_slice[stream_id] = None
+
+            # Then we modify this if sync channel is present to slice the last channel
+            # out of the stream buffer
             if "nidq" not in stream_name:
                 if not self.load_sync_channel and info["has_sync_trace"]:
-                    signal_channels = signal_channels[:-1]
+                    # the last channel is removed from the stream but not from the buffer
+                    self._stream_buffer_slice[stream_id] = slice(0, -1)
+
+                    # Add a buffer slice for the sync channel
+                    sync_stream_id = f"{stream_name}-SYNC"
+                    self._stream_buffer_slice[sync_stream_id] = slice(-1, None)
+
                 if self.load_sync_channel and not info["has_sync_trace"]:
                     raise ValueError("SYNC channel is not present in the recording. " "Set load_sync_channel to False")
+
+        signal_buffers = np.array(signal_buffers, dtype=_signal_buffer_dtype)
+
+        # Add sync channels as their own streams. We do it here to keep the order of the streams
+        for sync_stream_id, buffer_id in sync_stream_id_to_buffer_id.items():
+            signal_streams.append((sync_stream_id, sync_stream_id, buffer_id))
 
         signal_streams = np.array(signal_streams, dtype=_signal_stream_dtype)
         signal_channels = np.array(signal_channels, dtype=_signal_channel_dtype)
 
         # No events
         event_channels = []
+        # This is true only in case of 'nidq' stream
+        for stream_name in stream_names:
+            if "nidq" in stream_name:
+                info = self.signals_info_dict[0, stream_name]
+                if len(info["digital_channels"]) > 0:
+                    # add event channels
+                    for local_chan in info["digital_channels"]:
+                        chan_name = local_chan
+                        chan_id = f"{stream_name}#{chan_name}"
+                        event_channels.append((chan_name, chan_id, "event"))
+                    # add events_memmap
+                    data = np.memmap(info["bin_file"], dtype="int16", mode="r", offset=0, order="C")
+                    data = data.reshape(-1, info["num_chan"])
+                    # The digital word is usually the last channel, after all the individual analog channels
+                    extracted_word = data[:, len(info["analog_channels"])]
+                    self._events_memmap = np.unpackbits(extracted_word.astype(np.uint8)[:, None], axis=1)
         event_channels = np.array(event_channels, dtype=_event_channel_dtype)
 
         # No spikes
@@ -184,11 +259,26 @@ class SpikeGLXRawIO(BaseRawIO):
         spike_channels = np.array(spike_channels, dtype=_spike_channel_dtype)
 
         # deal with nb_segment and t_start/t_stop per segment
-        self._t_starts = {seg_index: 0.0 for seg_index in range(nb_segment)}
+        self._t_starts = {stream_name: {} for stream_name in stream_names}
         self._t_stops = {seg_index: 0.0 for seg_index in range(nb_segment)}
-        for seg_index in range(nb_segment):
-            for stream_name in stream_names:
+
+        for stream_name in stream_names:
+            for seg_index in range(nb_segment):
                 info = self.signals_info_dict[seg_index, stream_name]
+
+                frame_start = float(info["meta"]["firstSample"])
+                sampling_frequency = info["sampling_rate"]
+                t_start = frame_start / sampling_frequency
+
+                self._t_starts[stream_name][seg_index] = t_start
+
+                # This need special logic because sync not present in stream_names
+                if f"{stream_name}-SYNC" in signal_streams["name"]:
+                    sync_stream_name = f"{stream_name}-SYNC"
+                    if sync_stream_name not in self._t_starts:
+                        self._t_starts[sync_stream_name] = {}
+                    self._t_starts[sync_stream_name][seg_index] = t_start
+
                 t_stop = info["sample_length"] / info["sampling_rate"]
                 self._t_stops[seg_index] = max(self._t_stops[seg_index], t_stop)
 
@@ -196,6 +286,7 @@ class SpikeGLXRawIO(BaseRawIO):
         self.header = {}
         self.header["nb_block"] = 1
         self.header["nb_segment"] = [nb_segment]
+        self.header["signal_buffers"] = signal_buffers
         self.header["signal_streams"] = signal_streams
         self.header["signal_channels"] = signal_channels
         self.header["spike_channels"] = spike_channels
@@ -204,7 +295,6 @@ class SpikeGLXRawIO(BaseRawIO):
         # insert some annotation at some place
         self._generate_minimal_annotations()
         self._generate_minimal_annotations()
-        block_ann = self.raw_annotations["blocks"][0]
 
         for seg_index in range(nb_segment):
             seg_ann = self.raw_annotations["blocks"][0]["segments"][seg_index]
@@ -217,6 +307,10 @@ class SpikeGLXRawIO(BaseRawIO):
                 if self.load_channel_location:
                     # need probeinterface to be installed
                     import probeinterface
+
+                    # Skip for sync streams
+                    if "SYNC" in stream_name:
+                        continue
 
                     info = self.signals_info_dict[seg_index, stream_name]
                     if "imroTbl" in info["meta"] and info["stream_kind"] == "ap":
@@ -235,52 +329,55 @@ class SpikeGLXRawIO(BaseRawIO):
     def _segment_t_stop(self, block_index, seg_index):
         return self._t_stops[seg_index]
 
-    def _get_signal_size(self, block_index, seg_index, stream_index):
-        stream_id = self.header["signal_streams"][stream_index]["id"]
-        memmap = self._memmaps[seg_index, stream_id]
-        return int(memmap.shape[0])
-
     def _get_signal_t_start(self, block_index, seg_index, stream_index):
-        return 0.0
+        stream_name = self.header["signal_streams"][stream_index]["name"]
+        return self._t_starts[stream_name][seg_index]
 
-    def _get_analogsignal_chunk(self, block_index, seg_index, i_start, i_stop, stream_index, channel_indexes):
-        stream_id = self.header["signal_streams"][stream_index]["id"]
-        memmap = self._memmaps[seg_index, stream_id]
-        stream_name = self.header["signal_streams"]["name"][stream_index]
+    def _event_count(self, event_channel_idx, block_index=None, seg_index=None):
+        timestamps, _, _ = self._get_event_timestamps(block_index, seg_index, event_channel_idx, None, None)
+        return timestamps.size
 
-        # take care of sync channel
-        info = self.signals_info_dict[0, stream_name]
-        if not self.load_sync_channel and info["has_sync_trace"]:
-            memmap = memmap[:, :-1]
-
-        # since we cut the memmap, we can simplify the channel selection
-        if channel_indexes is None:
-            channel_selection = slice(None)
-        elif isinstance(channel_indexes, slice):
-            channel_selection = channel_indexes
-        elif not isinstance(channel_indexes, slice):
-            if np.all(np.diff(channel_indexes) == 1):
-                # consecutive channel then slice this avoid a copy (because of ndarray.take(...)
-                # and so keep the underlying memmap
-                channel_selection = slice(channel_indexes[0], channel_indexes[0] + len(channel_indexes))
-            else:
-                channel_selection = channel_indexes
+    def _get_event_timestamps(self, block_index, seg_index, event_channel_index, t_start=None, t_stop=None):
+        timestamps, durations, labels = [], None, []
+        info = self.signals_info_dict[0, "nidq"]  # There are no events that are not in the nidq stream
+        dig_ch = info["digital_channels"]
+        if len(dig_ch) > 0:
+            event_data = self._events_memmap
+            channel = dig_ch[event_channel_index]
+            ch_idx = 7 - int(channel[2:])  # They are in the reverse order
+            this_stream = event_data[:, ch_idx]
+            this_rising = np.where(np.diff(this_stream) == 1)[0] + 1
+            this_falling = (
+                np.where(np.diff(this_stream) == 255)[0] + 1
+            )  # because the data is in unsigned 8 bit, -1 = 255!
+            if len(this_rising) > 0:
+                timestamps.extend(this_rising)
+                labels.extend([f"{channel} ON"] * len(this_rising))
+            if len(this_falling) > 0:
+                timestamps.extend(this_falling)
+                labels.extend([f"{channel} OFF"] * len(this_falling))
+        timestamps = np.asarray(timestamps)
+        if len(labels) == 0:
+            labels = np.asarray(labels, dtype="U1")
         else:
-            raise ValueError("get_analogsignal_chunk : channel_indexes" "must be slice or list or array of int")
+            labels = np.asarray(labels)
+        return timestamps, durations, labels
 
-        raw_signals = memmap[slice(i_start, i_stop), channel_selection]
+    def _rescale_event_timestamp(self, event_timestamps, dtype, event_channel_index):
+        info = self.signals_info_dict[0, "nidq"]  # There are no events that are not in the nidq stream
+        event_times = event_timestamps.astype(dtype) / float(info["sampling_rate"])
+        return event_times
 
-        return raw_signals
+    def _rescale_epoch_duration(self, raw_duration, dtype, event_channel_index):
+        return None
+
+    def _get_analogsignal_buffer_description(self, block_index, seg_index, buffer_id):
+        return self._buffer_descriptions[block_index][seg_index][buffer_id]
 
 
 def scan_files(dirname):
     """
-    Scan for pairs of `.bin` and `.meta` files and return information about it.
-
-    After exploring the folder, the segment index (`seg_index`) is construct as follow:
-      * if only one `gate_num=0` then `trigger_num` = `seg_index`
-      * if only one `trigger_num=0` then `gate_num` = `seg_index`
-      * if both are increasing then seg_index increased by gate_num, trigger_num order.
+    Scan for pairs of `.bin` and `.meta` files and parse the metadata file to extract signal information.
     """
     info_list = []
 
@@ -290,6 +387,7 @@ def scan_files(dirname):
                 continue
             meta_filename = Path(root) / file
             bin_filename = meta_filename.with_suffix(".bin")
+
             if meta_filename.exists() and bin_filename.exists():
                 meta = read_meta_file(meta_filename)
                 info = extract_stream_info(meta_filename, meta)
@@ -298,24 +396,40 @@ def scan_files(dirname):
                 info["bin_file"] = str(bin_filename)
                 info_list.append(info)
 
-    # the segment index will depend on both 'gate_num' and 'trigger_num'
-    # so we order by 'gate_num' then 'trigger_num'
-    # None is before any int
-    def make_key(info):
-        k0 = info["gate_num"]
-        if k0 is None:
-            k0 = -1
-        k1 = info["trigger_num"]
-        if k1 is None:
-            k1 = -1
-        return (k0, k1)
-
-    order_key = list({make_key(info) for info in info_list})
-    order_key = sorted(order_key)
-    for info in info_list:
-        info["seg_index"] = order_key.index(make_key(info))
+    if len(info_list) == 0:
+        raise FileNotFoundError(f"No appropriate combination of .meta and .bin files were detected in {dirname}")
 
     return info_list
+
+
+def _add_segment_order(info_list):
+    """
+    Uses gate and trigger numbers to construct a segment index (`seg_index`) for each signal in `info_list`.
+
+    After exploring the folder, the segment index (`seg_index`) is construct as follow:
+      * if only one `gate_num=0` then `trigger_num` = `seg_index`
+      * if only one `trigger_num=0` then `gate_num` = `seg_index`
+      * if both are increasing then seg_index increased by gate_num, trigger_num order.
+
+    """
+    # This sets non-integers values before integers
+    normalize = lambda x: x if isinstance(x, int) else -1
+
+    # Segment index is determined by the gate_num and trigger_num in that order
+    def get_segment_tuple(info):
+        # Create a key from the normalized gate_num and trigger_num
+        gate_num = normalize(info.get("gate_num"))
+        trigger_num = normalize(info.get("trigger_num"))
+        return (gate_num, trigger_num)
+
+    unique_segment_tuples = {get_segment_tuple(info) for info in info_list}
+    sorted_keys = sorted(unique_segment_tuples)
+
+    # Map each unique key to a corresponding index
+    segment_tuple_to_segment_index = {key: idx for idx, key in enumerate(sorted_keys)}
+
+    for info in info_list:
+        info["seg_index"] = segment_tuple_to_segment_index[get_segment_tuple(info)]
 
 
 def parse_spikeglx_fname(fname):
@@ -326,67 +440,118 @@ def parse_spikeglx_fname(fname):
     https://github.com/billkarsh/SpikeGLX/blob/15ec8898e17829f9f08c226bf04f46281f106e5f/Markdown/UserManual.md#gates-and-triggers
 
     Example file name structure:
-    Consider the filenames: `Noise4Sam_g0_t0.nidq.bin` or `Noise4Sam_g0_t0.imec0.lf.bin`
+    Consider the filenames: `Noise4Sam_g0_t0.nidq.bin`, `Noise4Sam_g0_t0.imec0.lf.bin`, or `myRun_g0_t0.obx0.obx.bin`
     The filenames consist of 3 or 4 parts separated by `.`
     1. "Noise4Sam_g0_t0" will be the `name` variable. This choosen by the user at recording time.
-    2. "_g0_" is the "gate_num"
-    3. "_t0_" is the "trigger_num"
-    4. "nidq" or "imec0" will give the `device`
-    5. "lf" or "ap" will be the `stream_kind`
-        `stream_name` variable is the concatenation of `device.stream_kind`
+    2. "g0" is the "gate_num"
+    3. "t0" is the "trigger_num"
+    4. "nidq", "imec0", or "obx0" will give the `device`
+    5. "lf", "ap", or "obx" will be the `stream_kind`
+       `stream_name` variable is the concatenation of `device.stream_kind`
+
+    If CatGT is used, then the trigger numbers in the file names ("t0"/"t1"/etc.)
+    will be renamed to "tcat". In this case, the parsed "trigger_num" will be set to "cat".
 
     This function is copied/modified from Graham Findlay.
 
     Notes:
-       * Sometimes the original file name is modified by the user and "_gt0_" or "_t0_"
+        * Sometimes the original file name is modified by the user and "_g0_" or "_t0_"
           are manually removed. In that case gate_name and trigger_num will be None.
 
     Parameters
     ---------
     fname: str
-        The filename to parse without the extension, e.g. "my-run-name_g0_t1.imec2.lf"
+        The filename to parse without the extension, e.g. "my-run-name_g0_t1.imec2.lf" or "my-run-name_g0_t0.obx0.obx"
+
     Returns
     -------
     run_name: str
         The run name, e.g. "my-run-name".
     gate_num: int or None
         The gate identifier, e.g. 0.
-    trigger_num: int or None
-        The trigger identifier, e.g. 1.
+    trigger_num: int | str or None
+        The trigger identifier, e.g. 1. If CatGT is used, then the trigger_num will be set to "cat".
     device: str
-        The probe identifier, e.g. "imec2"
+        The probe identifier, e.g. "imec2" or "obx0"
     stream_kind: str or None
-        The data type identifier, "lf" or "ap" or None
+        The data type identifier, "lf", "ap", "obx", or None
     """
-    r = re.findall(r"(\S*)_g(\d*)_t(\d*)\.(\S*).(ap|lf)", fname)
-    if len(r) == 1:
-        # standard case with probe
-        run_name, gate_num, trigger_num, device, stream_kind = r[0]
-    else:
-        r = re.findall(r"(\S*)_g(\d*)_t(\d*)\.(\S*)", fname)
-        if len(r) == 1:
-            # case for nidaq
-            run_name, gate_num, trigger_num, device = r[0]
-            stream_kind = None
-        else:
-            # the naming do not correspond lets try something more easy
-            # example: sglx_xxx.imec0.ap
-            r = re.findall(r"(\S*)\.(\S*).(ap|lf)", fname)
-            if len(r) == 1:
-                run_name, device, stream_kind = r[0]
-                gate_num, trigger_num = None, None
-            else:
-                # easy case for nidaq, example: sglx_xxx.nidq
-                r = re.findall(r"(\S*)\.(\S*)", fname)
-                run_name, device = r[0]
-                gate_num, trigger_num, stream_kind = None, None, None
 
-    if gate_num is not None:
-        gate_num = int(gate_num)
-    if trigger_num is not None:
-        trigger_num = int(trigger_num)
+    # Standard case: contains gate, trigger, device, and stream kind
+    # Example: Noise4Sam_g0_t0.imec0.ap
+    # Format:  {run_name}_g{gate_num}_t{trigger_num}.{device}.{stream_kind}
+    # Regex tokens:
+    #   \S+         → one or more non-whitespace characters
+    #   \d+         → one or more digits
+    #   ap|lf       → either 'ap' or 'lf'
+    regex = r"(?P<run_name>\S+)_g(?P<gate_num>\d+)_t(?P<trigger_num>\d+)\.(?P<device>\S+)\.(?P<stream_kind>ap|lf)"
+    match = re.match(regex, fname)
+    if match:
+        gd = match.groupdict()
+        return gd["run_name"], int(gd["gate_num"]), int(gd["trigger_num"]), gd["device"], gd["stream_kind"]
 
-    return (run_name, gate_num, trigger_num, device, stream_kind)
+    # CatGT case: trigger renamed to 'tcat'
+    # Example: Noise4Sam_g0_tcat.imec0.ap
+    # Format:  {run_name}_g{gate_num}_tcat.{device}.{stream_kind}
+    # Regex tokens:
+    #   \S+         → one or more non-whitespace characters
+    #   \d+         → one or more digits
+    #   ap|lf       → either 'ap' or 'lf'
+    regex = r"(?P<run_name>\S+)_g(?P<gate_num>\d+)_tcat\.(?P<device>\S+)\.(?P<stream_kind>ap|lf)"
+    match = re.match(regex, fname)
+    if match:
+        gd = match.groupdict()
+        return gd["run_name"], int(gd["gate_num"]), "cat", gd["device"], gd["stream_kind"]
+
+    # OneBox case: ends in .obx
+    # Example: myRun_g0_t0.obx0.obx
+    # Format:  {run_name}_g{gate_num}_t{trigger_num}.{device}.obx
+    # Regex tokens:
+    #   \S+         → one or more non-whitespace characters
+    #   \d+         → one or more digits
+    regex = r"(?P<run_name>\S+)_g(?P<gate_num>\d+)_t(?P<trigger_num>\d+)\.(?P<device>\S+)\.obx"
+    match = re.match(regex, fname)
+    if match:
+        gd = match.groupdict()
+        return gd["run_name"], int(gd["gate_num"]), int(gd["trigger_num"]), gd["device"], "obx"
+
+    # NIDQ case no stream kind (not ap or lf)
+    # Example: Noise4Sam_g0_t0.nidq
+    # Format:  {run_name}_g{gate_num}_t{trigger_num}.{device}
+    # Regex tokens:
+    #   \S+         → one or more non-whitespace characters
+    #   \d+         → one or more digits
+    regex = r"(?P<run_name>\S+)_g(?P<gate_num>\d+)_t(?P<trigger_num>\d+)\.(?P<device>\S+)"
+    match = re.match(regex, fname)
+    if match:
+        gd = match.groupdict()
+        return gd["run_name"], int(gd["gate_num"]), int(gd["trigger_num"]), gd["device"], None
+
+    # Fallback case 1): no gate/trigger, includes device and stream kind
+    # Example: sglx_name.imec0.ap
+    # Format:  {run_name}.{device}.{stream_kind}
+    # Regex tokens:
+    #   \S+         → one or more non-whitespace characters
+    #   ap|lf       → either 'ap' or 'lf'
+    regex = r"(?P<run_name>\S+)\.(?P<device>\S+)\.(?P<stream_kind>ap|lf)"
+    match = re.match(regex, fname)
+    if match:
+        gd = match.groupdict()
+        return gd["run_name"], None, None, gd["device"], gd["stream_kind"]
+
+    # Fallback NIDQ-style: no stream kind
+    # Example: sglx_name.nidq
+    # Format:  {run_name}.{device}
+    # Regex tokens:
+    #   \S+         → one or more non-whitespace characters
+    regex = r"(?P<run_name>\S+)\.(?P<device>\S+)"
+    match = re.match(regex, fname)
+    if match:
+        gd = match.groupdict()
+        return gd["run_name"], None, None, gd["device"], None
+
+    # No known pattern matched
+    raise ValueError(f"Cannot parse filename {fname}")
 
 
 def read_meta_file(meta_file):
@@ -419,16 +584,23 @@ def extract_stream_info(meta_file, meta):
         # AP and LF meta have this field
         ap, lf, sy = [int(s) for s in meta["snsApLfSy"].split(",")]
         has_sync_trace = sy == 1
+    elif "snsXaDwSy" in meta:
+        # OneBox case
+        xa, dw, sy = [int(s) for s in meta["snsXaDwSy"].split(",")]
+        has_sync_trace = sy == 1
     else:
         # NIDQ case
         has_sync_trace = False
-    fname = Path(meta_file).stem
+
+    # This is the original name that the file had. It might not match the current name if the user changed it
+    original_bin_file_path = meta["fileName"]
+    fname = Path(original_bin_file_path).stem
+
     run_name, gate_num, trigger_num, device, stream_kind = parse_spikeglx_fname(fname)
 
     if "imec" in fname.split(".")[-2]:
         device = fname.split(".")[-2]
         stream_kind = fname.split(".")[-1]
-        stream_name = device + "." + stream_kind
         units = "uV"
         # please note the 1e6 in gain for this uV
 
@@ -438,7 +610,7 @@ def extract_stream_info(meta_file, meta):
         if (
             "imDatPrb_type" not in meta
             or meta["imDatPrb_type"] == "0"
-            or meta["imDatPrb_type"] in ("1015", "1022", "1030", "1031", "1032")
+            or meta["imDatPrb_type"] in ("1015", "1016", "1022", "1030", "1031", "1032", "1100", "1121", "1123", "1300")
         ):
             # This work with NP 1.0 case with different metadata versions
             # https://github.com/billkarsh/SpikeGLX/blob/15ec8898e17829f9f08c226bf04f46281f106e5f/Markdown/Metadata_30.md
@@ -465,10 +637,21 @@ def extract_stream_info(meta_file, meta):
             channel_gains = gain_factor * per_channel_gain * 1e6
         else:
             raise NotImplementedError("This meta file version of spikeglx" " is not implemented")
+    elif meta.get("typeThis") == "obx":
+        # OneBox case
+        device = fname.split(".")[-2] if "." in fname else device
+        stream_kind = ""
+        units = "V"
+
+        # OneBox gain calculation
+        # V = i * Vmax / Imax where Imax = obMaxInt, Vmax = obAiRangeMax
+        # See: https://billkarsh.github.io/SpikeGLX/Sgl_help/Metadata_30.html
+        max_int = int(meta["obMaxInt"])
+        gain_factor = float(meta["obAiRangeMax"]) / max_int
+        channel_gains = np.ones(num_chan) * gain_factor
     else:
         device = fname.split(".")[-1]
         stream_kind = ""
-        stream_name = device
         units = "V"
         channel_gains = np.ones(num_chan)
 
@@ -484,10 +667,17 @@ def extract_stream_info(meta_file, meta):
         gain_factor = float(meta["niAiRangeMax"]) / 32768
         channel_gains = per_channel_gain * gain_factor
 
+    probe_slot = meta.get("imDatPrb_slot", None)
+    probe_port = meta.get("imDatPrb_port", None)
+    probe_dock = meta.get("imDatPrb_dock", None)
+
+    # OneBox specific metadata
+    obx_slot = meta.get("imDatObx_slot", None)
+
     info = {}
     info["fname"] = fname
     info["meta"] = meta
-    for k in ("niSampRate", "imSampRate"):
+    for k in ("niSampRate", "imSampRate", "obSampRate"):
         if k in meta:
             info["sampling_rate"] = float(meta[k])
     info["num_chan"] = num_chan
@@ -497,11 +687,50 @@ def extract_stream_info(meta_file, meta):
     info["trigger_num"] = trigger_num
     info["device"] = device
     info["stream_kind"] = stream_kind
-    info["stream_name"] = stream_name
+    # All non-production probes (phase 3B onwards) have "typeThis", otherwise revert to file parsing
+    info["device_kind"] = meta.get("typeThis", device.split(".")[0])
     info["units"] = units
     info["channel_names"] = [txt.split(";")[0] for txt in meta["snsChanMap"]]
     info["channel_gains"] = channel_gains
     info["channel_offsets"] = np.zeros(info["num_chan"])
     info["has_sync_trace"] = has_sync_trace
+    info["probe_slot"] = int(probe_slot) if probe_slot else None
+    info["probe_port"] = int(probe_port) if probe_port else None
+    info["probe_dock"] = int(probe_dock) if probe_dock else None
+    info["obx_slot"] = int(obx_slot) if obx_slot else None
+
+    # Add device index
+    if info.get("device_kind") == "imec":
+        info["device_index"] = info["device"].split("imec")[-1]
+    elif info.get("device_kind") == "obx":
+        info["device_index"] = info["device"].split("obx")[-1]
+    else:
+        info["device_index"] = ""  # TODO: Handle multi nidq case, maybe use meta["typeNiEnabled"]
+
+    # Define stream base on device_kind [imec|nidq|obx], device_index and stream_kind [ap|lf] for imec
+    # Stream format is "{device_kind}{device_index}.{stream_kind}"
+    device_kind = info["device_kind"]
+    device_index = info["device_index"]
+    stream_kind = f".{info['stream_kind']}" if info["stream_kind"] else ""
+    info["stream_name"] = f"{device_kind}{device_index}{stream_kind}"
+
+    # Separate analog and digital channels
+    if device_kind == "nidq":
+        # Note that we only handling the non-multiplexed channels here
+        info["digital_channels"] = []
+        info["analog_channels"] = [channel for channel in info["channel_names"] if not channel.startswith("XD")]
+        # Digital/event channels are encoded within the digital word, so that will need more handling
+        if meta.get("niXDChans1", "") != "":
+            nixd_chans1_items = meta["niXDChans1"].split(",")
+            for item in nixd_chans1_items:
+                if ":" in item:
+                    start, end = map(int, item.split(":"))
+                    info["digital_channels"].extend([f"XD{i}" for i in range(start, end + 1)])
+                else:
+                    info["digital_channels"].append(f"XD{int(item)}")
+    elif device_kind == "obx":
+        # OneBox channel handling - focus on analog channels only as requested
+        info["digital_channels"] = [channel for channel in info["channel_names"] if channel.startswith("XD")]
+        info["analog_channels"] = [channel for channel in info["channel_names"] if channel.startswith("XA")]
 
     return info

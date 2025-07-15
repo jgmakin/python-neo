@@ -49,14 +49,15 @@ from ..baserawio import (
     BaseRawIO,
     _signal_channel_dtype,
     _signal_stream_dtype,
+    _signal_buffer_dtype,
     _spike_channel_dtype,
     _event_channel_dtype,
 )
-from operator import itemgetter
 import numpy as np
 import os
 import pathlib
 import copy
+import warnings
 from collections import namedtuple, OrderedDict
 
 from neo.rawio.neuralynxrawio.ncssections import NcsSection, NcsSectionsFactory
@@ -75,10 +76,12 @@ class NeuralynxRawIO(BaseRawIO):
     dirname: str, default: ''
         Name of directory containing all files for a dataset. If provided, filename is
         ignored. But one of either dirname or filename is required.
-    filename: str, default: ''
-        Name of a single ncs, nse, nev, or ntt file to include in dataset. Will be ignored,
-        if dirname is provided. But one of either dirname or filename is required.
-    exclude_filename: str | list | None, default: None
+    include_filenames: str | list | None, default: None
+        Name of a single ncs, nse, nev or ntt file or list of such files. Will only include
+        file names in the list. This can be plain filenames or fullpath or path relative to
+        dirname.
+        All files should be in a single path.
+    exclude_filenames: str | list | None, default: None
         Name of a single ncs, nse, nev or ntt file or list of such files. Expects plain
         filenames (without directory path).
         None will search for all file types
@@ -87,11 +90,11 @@ class NeuralynxRawIO(BaseRawIO):
         Otherwise set 0 of time to first time in dataset
     strict_gap_mode: bool, default: True
         Detect gaps using strict mode or not.
-          * strict_gap_mode = True then a gap is consider when timstamp difference between two 
+          * strict_gap_mode = True then a gap is consider when timstamp difference between two
             consequtive data packet is more than one sample interval.
           * strict_gap_mode = False then a gap has an increased tolerance. Some new system with different clock need this option
             otherwise, too many gaps are detected
-    
+
     Notes
     -----
     * This IO supports NCS, NEV, NSE and NTT file formats (not NVT or NRD yet)
@@ -128,30 +131,61 @@ class NeuralynxRawIO(BaseRawIO):
         ("channel_id", "uint32"),
         ("sample_rate", "uint32"),
         ("nb_valid", "uint32"),
-        ("samples", "int16", (NcsSection._RECORD_SIZE)),
+        ("samples", "int16", NcsSection._RECORD_SIZE),
     ]
 
-    def __init__(self, dirname="", filename="", exclude_filename=None, keep_original_times=False, strict_gap_mode=True, **kargs):
+    def __init__(
+        self,
+        dirname="",
+        include_filenames=None,
+        exclude_filenames=None,
+        keep_original_times=False,
+        strict_gap_mode=True,
+        filename=None,
+        exclude_filename=None,
+        **kargs,
+    ):
 
-        if dirname != "":
-            self.dirname = dirname
-            self.rawmode = "one-dir"
-        elif filename != "":
-            self.filename = filename
-            self.rawmode = "one-file"
+        if not dirname:
+            raise ValueError("`dirname` cannot be empty.")
+
+        if filename is not None:
+            include_filenames = [filename]
+            warnings.warn("`filename` is deprecated and will be removed. Please use `include_filenames` instead")
+
+        if exclude_filename is not None:
+            if isinstance(exclude_filename, str):
+                exclude_filenames = [exclude_filename]
+            else:
+                exclude_filenames = exclude_filename
+            warnings.warn(
+                "`exclude_filename` is deprecated and will be removed. Please use `exclude_filenames` instead"
+            )
+
+        if include_filenames is None:
+            include_filenames = []
+        elif isinstance(include_filenames, str):
+            include_filenames = [include_filenames]
+
+        if exclude_filenames is None:
+            exclude_filenames = []
+        elif isinstance(exclude_filenames, str):
+            exclude_filenames = [exclude_filenames]
+
+        if include_filenames:
+            self.rawmode = "multiple-files"
         else:
-            raise ValueError("One of dirname or filename must be provided.")
+            self.rawmode = "one-dir"
 
+        self.dirname = dirname
+        self.include_filenames = include_filenames
+        self.exclude_filenames = exclude_filenames
         self.keep_original_times = keep_original_times
         self.strict_gap_mode = strict_gap_mode
-        self.exclude_filename = exclude_filename
         BaseRawIO.__init__(self, **kargs)
 
     def _source_name(self):
-        if self.rawmode == "one-file":
-            return self.filename
-        else:
-            return self.dirname
+        return self.dirname
 
     def _parse_header(self):
 
@@ -182,32 +216,23 @@ class NeuralynxRawIO(BaseRawIO):
 
         if self.rawmode == "one-dir":
             filenames = sorted(os.listdir(self.dirname))
-            dirname = self.dirname
         else:
-            if not os.path.isfile(self.filename):
+            filenames = self.include_filenames
+
+        filenames = [f for f in filenames if f not in self.exclude_filenames]
+        full_filenames = [os.path.join(self.dirname, f) for f in filenames]
+
+        for filename in full_filenames:
+            if not os.path.isfile(filename):
                 raise ValueError(
                     f"Provided Filename is not a file: "
-                    f"{self.filename}. If you want to provide a "
+                    f"{filename}. If you want to provide a "
                     f"directory use the `dirname` keyword"
                 )
 
-            dirname, fname = os.path.split(self.filename)
-            filenames = [fname]
-
-        if not isinstance(self.exclude_filename, (list, set, np.ndarray)):
-            self.exclude_filename = [self.exclude_filename]
-
-        # remove files that were explicitly excluded
-        if self.exclude_filename is not None:
-            for excl_file in self.exclude_filename:
-                if excl_file in filenames:
-                    filenames.remove(excl_file)
-
         stream_props = {}  # {(sampling_rate, n_samples, t_start): {stream_id: [filenames]}
 
-        for filename in filenames:
-            filename = os.path.join(dirname, filename)
-
+        for filename in full_filenames:
             _, ext = os.path.splitext(filename)
             ext = ext[1:]  # remove dot
             ext = ext.lower()  # make lower case for comparisons
@@ -237,12 +262,14 @@ class NeuralynxRawIO(BaseRawIO):
                         t_start = copy.copy(file_mmap[0][0])
                     else:  # empty file
                         t_start = 0
-                    stream_prop = (info["sampling_rate"], n_packets, t_start)
+                    stream_prop = (float(info["sampling_rate"]), int(n_packets), float(t_start))
                     if stream_prop not in stream_props:
                         stream_props[stream_prop] = {"stream_id": len(stream_props), "filenames": [filename]}
                     else:
                         stream_props[stream_prop]["filenames"].append(filename)
                     stream_id = stream_props[stream_prop]["stream_id"]
+                    # @zach @ramon : we need to discuss this split by channel buffer
+                    buffer_id = ""
 
                     # a sampled signal channel
                     units = "uV"
@@ -251,7 +278,17 @@ class NeuralynxRawIO(BaseRawIO):
                         gain *= -1
                     offset = 0.0
                     signal_channels.append(
-                        (chan_name, str(chan_id), info["sampling_rate"], "int16", units, gain, offset, stream_id)
+                        (
+                            chan_name,
+                            str(chan_id),
+                            info["sampling_rate"],
+                            "int16",
+                            units,
+                            gain,
+                            offset,
+                            stream_id,
+                            buffer_id,
+                        )
                     )
                     self.ncs_filenames[chan_uid] = filename
                     keys = [
@@ -345,11 +382,13 @@ class NeuralynxRawIO(BaseRawIO):
         if signal_channels.size > 0:
             # ordering streams according from high to low sampling rates
             stream_props = {k: stream_props[k] for k in sorted(stream_props, reverse=True)}
-            names = [f"Stream (rate,#packet,t0): {sp}" for sp in stream_props]
-            ids = [stream_prop["stream_id"] for stream_prop in stream_props.values()]
-            signal_streams = list(zip(names, ids))
+            stream_names = [f"Stream (rate,#packet,t0): {sp}" for sp in stream_props]
+            stream_ids = [stream_prop["stream_id"] for stream_prop in stream_props.values()]
+            buffer_ids = ["" for sp in stream_props]
+            signal_streams = list(zip(stream_names, stream_ids, buffer_ids))
         else:
             signal_streams = []
+        signal_buffers = np.array([], dtype=_signal_buffer_dtype)
         signal_streams = np.array(signal_streams, dtype=_signal_stream_dtype)
 
         # set 2 attributes needed later for header in case there are no ncs files in dataset,
@@ -484,6 +523,7 @@ class NeuralynxRawIO(BaseRawIO):
         self.header = {}
         self.header["nb_block"] = 1
         self.header["nb_segment"] = [self._nb_segment]
+        self.header["signal_buffers"] = signal_buffers
         self.header["signal_streams"] = signal_streams
         self.header["signal_channels"] = signal_channels
         self.header["spike_channels"] = spike_channels
@@ -797,7 +837,9 @@ class NeuralynxRawIO(BaseRawIO):
 
             verify_sec_struct = NcsSectionsFactory._verifySectionsStructure
             if not chanSectMap or (not verify_sec_struct(data, chan_ncs_sections)):
-                chan_ncs_sections = NcsSectionsFactory.build_for_ncs_file(data, nlxHeader, strict_gap_mode=self.strict_gap_mode)
+                chan_ncs_sections = NcsSectionsFactory.build_for_ncs_file(
+                    data, nlxHeader, strict_gap_mode=self.strict_gap_mode
+                )
 
             # register file section structure for all contained channels
             for chan_uid in zip(nlxHeader["channel_names"], np.asarray(nlxHeader["channel_ids"], dtype=str)):

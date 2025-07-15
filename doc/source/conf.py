@@ -60,7 +60,7 @@ master_doc = "index"
 
 # General information about the project.
 project = "Neo"
-copyright = "2010-2024, " + AUTHORS
+copyright = "2010-2025, " + AUTHORS
 
 # The version info for the project you're documenting, acts as replacement for
 # |version| and |release|, also used in various other places throughout the
@@ -252,6 +252,7 @@ rst_epilog = """
 )
 
 sphinx_gallery_conf = {
+    # 'only_warn_on_example_error': True, # helps with debugging broken examples
     "examples_dirs": "../../examples",  # path to your example scripts
     "gallery_dirs": "examples",  # path to where to save gallery generated output
 }

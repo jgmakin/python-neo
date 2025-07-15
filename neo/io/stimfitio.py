@@ -26,11 +26,13 @@ Based on exampleio.py and axonio.py from neo.io
 08 Feb 2014, C. Schmidt-Hieber, University College London
 """
 
+import importlib.util
+
 import numpy as np
 import quantities as pq
 
 from neo.io.baseio import BaseIO
-from neo.core import Block, Segment, AnalogSignal
+from neo.core import Block, Segment, AnalogSignal, NeoReadWriteError
 
 
 class StimfitIO(BaseIO):
@@ -92,7 +94,9 @@ class StimfitIO(BaseIO):
         """
         # We need this module, so try importing now so that it fails on
         # instantiation rather than read_block
-        import stfio  # noqa
+        stfio_spec = importlib.util.find_spec("stfio")
+        if stfio_spec is None:
+            raise ImportError("stfio must be installed to use StimfitIO")
 
         BaseIO.__init__(self)
 
@@ -106,7 +110,8 @@ class StimfitIO(BaseIO):
     def read_block(self, lazy=False):
         import stfio
 
-        assert not lazy, "Do not support lazy"
+        if lazy:
+            raise NeoReadWriteError("This IO does not support lazy reading")
 
         if self.filename is not None:
             self.stfio_rec = stfio.read(self.filename)
