@@ -13,7 +13,7 @@ Author: Julia Sprenger
 import numpy as np
 
 try:
-    from pyedflib import EdfReader
+    from pyedflib import EdfReader, DO_NOT_READ_ANNOTATIONS
 
     HAS_PYEDF = True
 except ImportError:
@@ -59,13 +59,14 @@ class EDFRawIO(BaseRawIO):
     extensions = ["edf"]
     rawmode = "one-file"
 
-    def __init__(self, filename=""):
+    def __init__(self, filename="", read_annotations=True):
         if not HAS_PYEDF:
             raise ValueError("Requires pyedflib")
         BaseRawIO.__init__(self)
 
         # note that this filename is used in self._source_name
         self.filename = filename
+        self.read_annotations = read_annotations
 
         self.signal_headers = []
         self.edf_header = {}
@@ -293,7 +294,10 @@ class EDFRawIO(BaseRawIO):
         return np.asarray(raw_duration, dtype=dtype)
 
     def _open_reader(self):
-        self.edf_reader = EdfReader(self.filename)
+        if not self.read_annotations:
+            self.edf_reader = EdfReader(self.filename, annotations_mode=DO_NOT_READ_ANNOTATIONS)
+        else:
+            self.edf_reader = EdfReader(self.filename)
 
     def __enter__(self):
         return self

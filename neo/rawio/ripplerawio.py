@@ -1562,6 +1562,7 @@ class RippleRawIO(BaseRawIO):
                 year=self.__nev_basic_header['year'],
                 month=self.__nev_basic_header['month'],
                 day=self.__nev_basic_header['day'],
+                # day=np.uint16(self.filename.split('/')[-2][-2:]), # Added as a fix because some files had invalid dates or something in the header...? - Abraar
                 hour=self.__nev_basic_header['hour'],
                 minute=self.__nev_basic_header['minute'],
                 second=self.__nev_basic_header['second'],
